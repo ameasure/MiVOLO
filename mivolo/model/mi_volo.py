@@ -145,7 +145,10 @@ class MiVOLO:
         with torch.no_grad():
             if self.half:
                 model_input = model_input.half()
-            output = self.model(model_input)
+                with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+                    output = self.model(model_input)
+            else:
+                output = self.model(model_input)
         return output
 
     def predict(self, image: np.ndarray, detected_bboxes: PersonAndFaceResult):
