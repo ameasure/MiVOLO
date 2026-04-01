@@ -3,6 +3,7 @@ from typing import Dict, Generator, List, Optional, Tuple
 
 import cv2
 import numpy as np
+import torch
 import tqdm
 from mivolo.model.mi_volo import MiVOLO
 from mivolo.model.yolo_detector import Detector
@@ -11,11 +12,12 @@ from mivolo.structures import AGE_GENDER_TYPE, PersonAndFaceResult
 
 class Predictor:
     def __init__(self, config, verbose: bool = False):
-        self.detector = Detector(config.detector_weights, config.device, verbose=verbose)
+        half = getattr(config, "half", True) and torch.device(config.device).type != "cpu"
+        self.detector = Detector(config.detector_weights, config.device, half=half, verbose=verbose)
         self.age_gender_model = MiVOLO(
             config.checkpoint,
             config.device,
-            half=True,
+            half=half,
             use_persons=config.with_persons,
             disable_faces=config.disable_faces,
             verbose=verbose,

@@ -86,7 +86,7 @@ class MiVOLO:
     ):
         self.verbose = verbose
         self.device = torch.device(device)
-        self.half = half and self.device.type != "cpu"
+        self.half = half
 
         self.meta: Meta = Meta().load_from_ckpt(ckpt_path, disable_faces, use_persons)
         if self.verbose:
