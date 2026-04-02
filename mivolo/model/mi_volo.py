@@ -29,7 +29,6 @@ class Meta:
         self.input_size = 224
 
     def load_from_ckpt(self, ckpt_path: str, disable_faces: bool = False, use_persons: bool = True) -> "Meta":
-
         state = torch.load(ckpt_path, map_location="cpu")
 
         self.min_age = state["min_age"]
@@ -78,7 +77,7 @@ class MiVOLO:
         self,
         ckpt_path: str,
         device: str = "cuda",
-        half: bool = True,
+        half: bool = True,  # kept for API compatibility; MiVOLO always runs in FP32
         disable_faces: bool = False,
         use_persons: bool = True,
         verbose: bool = False,
@@ -86,7 +85,13 @@ class MiVOLO:
     ):
         self.verbose = verbose
         self.device = torch.device(device)
-        self.half = half
+
+        if half:
+            _logger.warning("MiVOLO ignores half=True and runs in FP32 for stability")
+
+        # Force stable precision for this model.
+        self.half = False
+        self._warmed_up = False
 
         self.meta: Meta = Meta().load_from_ckpt(ckpt_path, disable_faces, use_persons)
         if self.verbose:
@@ -101,7 +106,7 @@ class MiVOLO:
             checkpoint_path=ckpt_path,
             filter_keys=["fds."],
         )
-        self.param_count = sum([m.numel() for m in self.model.parameters()])
+        self.param_count = sum(m.numel() for m in self.model.parameters())
         _logger.info(f"Model {model_name} created, param count: {self.param_count}")
 
         self.data_config = resolve_data_config(
@@ -109,46 +114,65 @@ class MiVOLO:
             verbose=verbose,
             use_test_size=True,
         )
-
         self.data_config["crop_pct"] = 1.0
         c, h, w = self.data_config["input_size"]
         assert h == w, "Incorrect data_config"
         self.input_size = w
 
-        self.model = self.model.to(self.device)
+        # Always keep weights in FP32 on device.
+        self.model = self.model.to(self.device).float().eval()
 
         if torchcompile:
-            assert has_compile, "A version of torch w/ torch.compile() is required for --compile, possibly a nightly."
+            assert has_compile, "A version of torch w/ torch.compile() is required for --compile."
             torch._dynamo.reset()
             self.model = torch.compile(self.model, backend=torchcompile)
 
-        self.model.eval()
-        if self.half:
-            self.model = self.model.half()
+    def warmup(self, batch_size: int = 1, steps: int = 2):
+        if self._warmed_up:
+            return
 
-    def warmup(self, batch_size: int, steps=10):
         if self.meta.with_persons_model:
             input_size = (6, self.input_size, self.input_size)
         else:
             input_size = self.data_config["input_size"]
 
-        input = torch.randn((batch_size,) + tuple(input_size)).to(self.device)
-
-        for _ in range(steps):
-            out = self.inference(input)  # noqa: F841
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
-    def inference(self, model_input: torch.tensor) -> torch.tensor:
+        x = torch.randn((batch_size,) + tuple(input_size), device=self.device, dtype=torch.float32)
 
         with torch.no_grad():
-            if self.half:
-                model_input = model_input.half()
-                with torch.autocast(device_type=self.device.type, dtype=torch.float16):
-                    output = self.model(model_input)
-            else:
-                output = self.model(model_input)
+            with torch.autocast(device_type=self.device.type, enabled=False):
+                for _ in range(steps):
+                    y = self.model(x)
+                    if not torch.isfinite(y).all():
+                        raise RuntimeError("MiVOLO warmup produced non-finite output")
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+
+        self._warmed_up = True
+        _logger.info("MiVOLO warmup complete (FP32, autocast disabled)")
+
+    def inference(self, model_input: torch.Tensor) -> torch.Tensor:
+        # Lazy warmup so first real use is already in a good state.
+        if not self._warmed_up:
+            self.warmup(batch_size=max(1, int(model_input.shape[0])))
+
+        x = model_input.to(device=self.device, dtype=torch.float32, non_blocking=True)
+
+        with torch.no_grad():
+            with torch.autocast(device_type=self.device.type, enabled=False):
+                output = self.model(x)
+
+        if not torch.isfinite(output).all():
+            _logger.warning("MiVOLO produced non-finite output; retrying once after cuda sync")
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            x = x.contiguous()
+            with torch.no_grad():
+                with torch.autocast(device_type=self.device.type, enabled=False):
+                    output = self.model(x)
+            if not torch.isfinite(output).all():
+                raise RuntimeError("MiVOLO inference produced non-finite output after retry")
+
         return output
 
     def predict(self, image: np.ndarray, detected_bboxes: PersonAndFaceResult):
@@ -161,7 +185,6 @@ class MiVOLO:
             return
 
         faces_input, person_input, faces_inds, bodies_inds = self.prepare_crops(image, detected_bboxes)
-
         if faces_input is None and person_input is None:
             # nothing to process
             return
@@ -170,6 +193,7 @@ class MiVOLO:
             model_input = torch.cat((faces_input, person_input), dim=1)
         else:
             model_input = faces_input
+
         output = self.inference(model_input)
 
         # write gender and age results into detected_bboxes
@@ -193,25 +217,26 @@ class MiVOLO:
 
             # get_age
             age = age_output[index].item()
+            if not np.isfinite(age):
+                raise RuntimeError("MiVOLO age output is non-finite")
             age = age * (self.meta.max_age - self.meta.min_age) + self.meta.avg_age
             age = round(age, 2)
 
             detected_bboxes.set_age(face_ind, age)
             detected_bboxes.set_age(body_ind, age)
-
             _logger.info(f"\tage: {age}")
 
             if gender_probs is not None:
                 gender = "male" if gender_indx[index].item() == 0 else "female"
                 gender_score = gender_probs[index].item()
+                if not np.isfinite(gender_score):
+                    raise RuntimeError("MiVOLO gender score is non-finite")
 
                 _logger.info(f"\tgender: {gender} [{int(gender_score * 100)}%]")
-
                 detected_bboxes.set_gender(face_ind, gender, gender_score)
                 detected_bboxes.set_gender(body_ind, gender, gender_score)
 
     def prepare_crops(self, image: np.ndarray, detected_bboxes: PersonAndFaceResult):
-
         if self.meta.use_person_crops and self.meta.use_face_crops:
             detected_bboxes.associate_faces_with_persons()
 
