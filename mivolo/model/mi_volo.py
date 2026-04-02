@@ -77,7 +77,7 @@ class MiVOLO:
         self,
         ckpt_path: str,
         device: str = "cuda",
-        half: bool = True,  # kept for API compatibility; MiVOLO always runs in FP32
+        half: bool = True,
         disable_faces: bool = False,
         use_persons: bool = True,
         verbose: bool = False,
@@ -85,13 +85,11 @@ class MiVOLO:
     ):
         self.verbose = verbose
         self.device = torch.device(device)
-
-        if half:
-            _logger.warning("MiVOLO ignores half=True and runs in FP32 for stability")
-
-        # Force stable precision for this model.
-        self.half = False
+        self.half = bool(half and self.device.type == "cuda")
         self._warmed_up = False
+
+        if half and self.device.type != "cuda":
+            _logger.warning("MiVOLO half=True requested on non-CUDA device; falling back to FP32")
 
         self.meta: Meta = Meta().load_from_ckpt(ckpt_path, disable_faces, use_persons)
         if self.verbose:
@@ -119,8 +117,10 @@ class MiVOLO:
         assert h == w, "Incorrect data_config"
         self.input_size = w
 
-        # Always keep weights in FP32 on device.
-        self.model = self.model.to(self.device).float().eval()
+        if self.half:
+            self.model = self.model.to(self.device).half().eval()
+        else:
+            self.model = self.model.to(self.device).float().eval()
 
         if torchcompile:
             assert has_compile, "A version of torch w/ torch.compile() is required for --compile."
@@ -136,7 +136,8 @@ class MiVOLO:
         else:
             input_size = self.data_config["input_size"]
 
-        x = torch.randn((batch_size,) + tuple(input_size), device=self.device, dtype=torch.float32)
+        dtype = torch.float16 if self.half else torch.float32
+        x = torch.randn((batch_size,) + tuple(input_size), device=self.device, dtype=dtype)
 
         with torch.no_grad():
             with torch.autocast(device_type=self.device.type, enabled=False):
@@ -149,14 +150,15 @@ class MiVOLO:
             torch.cuda.synchronize()
 
         self._warmed_up = True
-        _logger.info("MiVOLO warmup complete (FP32, autocast disabled)")
+        _logger.info("MiVOLO warmup complete (%s)", "FP16" if self.half else "FP32")
 
     def inference(self, model_input: torch.Tensor) -> torch.Tensor:
         # Lazy warmup so first real use is already in a good state.
         if not self._warmed_up:
             self.warmup(batch_size=max(1, int(model_input.shape[0])))
 
-        x = model_input.to(device=self.device, dtype=torch.float32, non_blocking=True)
+        dtype = torch.float16 if self.half else torch.float32
+        x = model_input.to(device=self.device, dtype=dtype, non_blocking=True)
 
         with torch.no_grad():
             with torch.autocast(device_type=self.device.type, enabled=False):
